@@ -1,0 +1,194 @@
+---
+title: "Topic Modeling"
+author: "Gary Wang"
+date: "2024-11-01"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,warning=FALSE}
+library(lexicon)
+library(tidyverse)
+library(topicmodels)
+library(tidytext)
+library(factoextra)
+library(dplyr)
+library(ggplot2)
+library(wordcloud)
+library(RColorBrewer)
+```
+
+```{r}
+movies <- read.csv("movie_plots.csv")
+```
+
+Group by Genre, summarize common words, and find genre frequency
+```{r}
+# Extract genres based on common keywords found in the plot descriptions
+movies <- movies %>%
+  mutate(Genre = case_when(
+    str_detect(Plot, "(?i)science|space|experiment|future|alien|
+               robot|technology|planet|human|new world|earth") ~ "Sci-Fi",
+    str_detect(Plot, "(?i)love|romance|relationship|affair|
+               wedding|couple|meets|girl") ~ "Romance",
+    str_detect(Plot, "(?i)war|battle|army|soldier|conflict|
+               military|enemy|tank|battlefield|dead") ~ "War",
+    str_detect(Plot, "(?i)ghost|haunt|horror|fear|terror|
+               scary|supernatural|creepy") ~ "Horror",
+    str_detect(Plot, "(?i)crime|detective|murder|investigate|
+               thriller|mafia|heist|mystery") ~ "Crime",
+    str_detect(Plot, "(?i)action|fight|fighting|adventure|hero|explosion|
+               battle|rescue") ~ "Action",
+    str_detect(Plot, "(?i)comedy|funny|humor|laugh|joke|
+               satire|parody") ~ "Comedy",
+    str_detect(Plot, "(?i)history|historical|biography|true story|
+               period drama|century|ancient") ~ "History",
+    str_detect(Plot, "(?i)fantasy|magic|myth|legend|superhero|
+               kingdom|evil") ~ "Fantasy",
+    str_detect(Plot, "(?i)western|cowboy|wild west|sheriff|ranch|
+               town|outlaw") ~ "Western",
+    str_detect(Plot, "(?i)documentary|docu|true events|reality|
+               biopic") ~ "Documentary",
+    str_detect(Plot, "(?i)sport|game|team|match|championship|
+               wrestling") ~ "Sport",
+    str_detect(Plot, "(?i)home|people|brother|daughter|brothers|
+               friend|wife|son|father|mother") ~ "Family",
+    TRUE ~ "Other"
+  ))
+
+# Calculate the frequency of each genre
+genre_frequency <- movies %>%
+  count(Genre, name = "Frequency")
+
+# Tokenize the plots and remove stop words
+plot_words <- movies %>%
+  unnest_tokens(word, Plot) %>%
+  anti_join(get_stopwords()) %>%
+  count(Genre, word, sort = TRUE)
+
+# Group by Genre, summarize common words, and find genre frequency
+nested_data <- plot_words %>%
+  group_by(Genre) %>%
+  summarize(
+    Words = paste(unique(word), collapse = ", ")
+  ) %>%
+  left_join(genre_frequency, by = "Genre")
+
+view(nested_data)
+```
+
+Create a Document Term Matrix
+```{r}
+dtm <- plot_words %>%
+  cast_dtm(Genre, word, n)
+
+dtm
+```
+
+Fir the LDA Model
+```{r}
+# Since we have 14 genres, we try to set k close to the number of genres.
+k <- 20
+
+# Fit the LDA model with k = 14
+lda_model <- LDA(dtm, k = k, control = list(seed = 999))
+
+# Extract the topic-term matrix
+topics <- tidy(lda_model, matrix = "beta")
+
+# View the top 10 terms for each topic
+top_terms <- topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+print(top_terms)
+
+# Plot the top terms for visualization
+ggplot(top_terms, aes(x = reorder_within(term, beta, topic), y = beta, 
+                      fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Top 10 Terms for Each Topic", x = "Terms", 
+       y = "Beta (Probability)")
+```
+
+Cluster Plot and Gamma Plot
+```{r}
+# Filter the topic-term matrix to include only the top 50 most frequent terms
+filtered_topics <- topics %>%
+  group_by(term) %>%
+  summarize(total_beta = sum(beta)) %>%
+  top_n(50, total_beta)
+
+topic_term_matrix <- topics %>%
+  filter(term %in% filtered_topics$term) %>%
+  spread(term, beta) %>%
+  column_to_rownames(var = "topic")
+
+# Perform PCA on the filtered topic-term matrix
+pca_result <- prcomp(topic_term_matrix, scale. = TRUE)
+
+# Plot the PCA result
+fviz_pca_biplot(pca_result,
+                repel = TRUE,
+                col.var = "blue",
+                col.ind = "red",
+                pointsize = 3,
+                alpha.ind = 0.6,
+                title = "Cluster Plot of Topics")
+```
+```{r}
+# Extract the document-topic distribution (gamma values)
+doc_topic_matrix <- tidy(lda_model, matrix = "gamma")
+
+# Aggregate by genre and calculate the average gamma per topic
+genre_topic_distribution <- doc_topic_matrix %>%
+  rename(Genre = document) %>%
+  group_by(Genre, topic) %>%
+  summarize(avg_gamma = mean(gamma, na.rm = TRUE), .groups = "drop")
+
+# Identify the dominant topic for each genre
+dominant_topics <- genre_topic_distribution %>%
+  group_by(Genre) %>%
+  slice_max(avg_gamma, n = 1) %>%
+  ungroup()
+
+print(dominant_topics)
+
+ggplot(dominant_topics, aes(x = Genre, y = avg_gamma, fill = factor(topic))) +
+  geom_col() +
+  labs(title = "Dominant Topics for Each Genre",
+       x = "Genre",
+       y = "Average Gamma",
+       fill = "Topic") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Create a Word Clound for each genre
+```{r, warning=FALSE}
+# Set up color palette
+palette <- brewer.pal(8, "Dark2")
+
+# Create word clouds for each topic in a loop
+k <- 14
+for (i in 1:k) {
+  # Filter words for the current topic
+  topic_words <- topics %>%
+    filter(topic == i) %>%
+    arrange(desc(beta))
+  
+  # Create the word cloud for the current topic
+  wordcloud(words = topic_words$term,
+            freq = topic_words$beta,
+            max.words = 100,
+            random.order = FALSE,
+            colors = palette)
+}
+```
